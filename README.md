@@ -3,6 +3,10 @@ RoRejoin watches multiple Roblox accounts simultaneously. When one crashes, it a
 
 !Quick warning, Virustotal detects this as a trojan, it is not. That's why I always give the source code too.!
 
+To make the source code (.py) into an exe, type "powershell" in the top bar of the folder where you saved it, then paste this command:
+python -m PyInstaller --onefile --windowed --collect-all customtkinter --name RoRejoin rorejoin.py
+and hit enter
+
 <img width="825" height="1157" alt="RoRejoin accounts page" src="https://github.com/user-attachments/assets/39b9e02c-96f8-445f-ac6d-ab11dc1ae3d5" />
 <img width="822" height="1162" alt="RoRejoin setup page" src="https://github.com/user-attachments/assets/ee5ec741-b251-4bab-ba77-cbc7e6962445" />
 <img width="821" height="1157" alt="RoRejoin Monitor page" src="https://github.com/user-attachments/assets/a7a53799-a395-4359-913b-7757658155c8" />
