@@ -1,5 +1,6 @@
 # RoRejoin
 RoRejoin watches multiple Roblox accounts simultaneously. When one crashes, it auto-rejoins into a fresh server after a configurable delay. Set different places and delays per account, arm periodic auto-kill timers, and receive Discord webhook notifications on every crash, rejoin, and session event. This tool is made with mostly Claude Opus 4.8 and Fabel 5
+
 !Quick warning, Virustotal detects this as a trojan, it is not. That's why I always give the source code too.!
 
 <img width="825" height="1157" alt="RoRejoin accounts page" src="https://github.com/user-attachments/assets/39b9e02c-96f8-445f-ac6d-ab11dc1ae3d5" />
