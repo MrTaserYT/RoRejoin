@@ -19,4 +19,3 @@ Virustotal says RoRejoin is a trojan, it is not. You can check out the source co
 <img width="1402" height="827" alt="RoRejoinV2 Setup" src="https://github.com/user-attachments/assets/3898b024-bb0e-46f9-b0e6-1fb65b50ad96" />
 <img width="1402" height="827" alt="RoRejoinV2 Accounts" src="https://github.com/user-attachments/assets/99c73ea3-c34e-4415-94d0-7e97f7e46aa8" />
 <img width="1402" height="827" alt="RoRejoinV2 Monitor" src="https://github.com/user-attachments/assets/854ce9c6-746e-4445-b18b-6942d6f8cf05" />
-.
