@@ -7,7 +7,7 @@
 - Join-server mode — paste a share link and every account joins the same private server
 - Window tiling and stacking layout for multi-instance setups
 - Live monitor dashboard with uptime, crash count, and auto-kill countdowns
-- Discord bot for remote control and webhook notifications
+- Discord webhook notifications
 - Settings persist between sessions with DPAPI-encrypted cookie storage
 
 Built with Python, CustomTkinter, Claude Opus 4.8 (main), gemini (only small stuff)
