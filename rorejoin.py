@@ -51,6 +51,7 @@ ROBLOX_EXE = "RobloxPlayerBeta.exe"
 POLL_SECONDS = 2.0
 LAUNCH_STAGGER = 8          # seconds between sequential account launches
 CREATE_NO_WINDOW = 0x08000000
+DEFAULT_SERVER_CAP = 50    # assumed max players when the API omits capacity
 
 AUTH_TICKET_URL = "https://auth.roblox.com/v1/authentication-ticket/"
 USERS_AUTH_URL = "https://users.roblox.com/v1/users/authenticated"
@@ -617,22 +618,28 @@ def get_auth_ticket(cookie: str) -> str | None:
         return None
 
 
-def build_launch_uri(ticket: str, place_id: str, instance_id: str | None = None) -> str:
+def build_launch_uri(ticket: str, place_id: str, instance_id: str | None = None,
+                     browser_tracker_id: int | None = None) -> str:
+    """Build the roblox-player launch URI, matching the exact format used by
+    Roblox Account Manager (the widely-working multi-account tool). Joining a
+    specific server uses request=RequestGameJob with &gameId=<jobId>; open
+    matchmaking uses request=RequestGame. The trailing +channel: field and the
+    isPlayTogetherGame flag are intentionally omitted to match RAM."""
     if instance_id:
-        # join one SPECIFIC server instance (from a share link)
+        # join one SPECIFIC server instance
         pl = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx"
-              f"?request=RequestGameJob&placeId={place_id}&gameId={instance_id}"
-              "&isPlayTogetherGame=false")
+              f"?request=RequestGameJob&placeId={place_id}&gameId={instance_id}")
     else:
-        # RequestGame -> Roblox drops you into a fresh/open server.
+        # RequestGame -> Roblox drops you into an open server (matchmaking)
         pl = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx"
               f"?request=RequestGame&placeId={place_id}&isPlayTogetherGame=false")
     pl_enc = urllib.parse.quote(pl, safe="")
     launch_ms = int(time.time() * 1000)
-    btid = random.randint(100_000_000_000, 999_999_999_999)
+    btid = browser_tracker_id or random.randint(100_000_000_000, 999_999_999_999)
     return (f"roblox-player:1+launchmode:play+gameinfo:{ticket}"
-            f"+launchtime:{launch_ms}+placelauncherurl:{pl_enc}"
-            f"+browsertrackerid:{btid}+robloxLocale:en_us+gameLocale:en_us+channel:")
+            f"+launchtime:{launch_ms}+browsertrackerid:{btid}"
+            f"+placelauncherurl:{pl_enc}"
+            f"+robloxLocale:en_us+gameLocale:en_us")
 
 
 def parse_place_id(raw: str) -> str | None:
@@ -713,6 +720,164 @@ def resolve_share_link(cookie: str, code: str, link_type: str
     if place is None:
         return None, None
     return str(place), (str(inst) if inst else None)
+
+
+def fetch_public_servers(place_id: str, cookie: str | None = None,
+                         want: int = 50, min_free: int = 4, log=None) -> list[str]:
+    """Return a list of job IDs (server instance IDs) for public running
+    servers of a place, ordered lowest-ping first (with room).
+
+    Only servers with room are kept. Note: Roblox's listed ping is sometimes
+    inaccurate, so the ordering is best-effort. Returns [] on any error.
+    """
+    base = (f"https://games.roblox.com/v1/games/{place_id}/servers/Public"
+            f"?sortOrder=Desc&limit=100")
+    # collect (ping, free_slots, jid) for every server that has room
+    rated: list[tuple[float, int, str]] = []   # has a real ping value
+    unrated: list[tuple[int, str]] = []        # no ping data → order by room
+    cursor = ""
+    pages = 0
+    total_seen = 0
+    rej_full = 0
+    try:
+        while pages < 6 and (len(rated) + len(unrated)) < want:
+            url = base + (f"&cursor={cursor}" if cursor else "")
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            if cookie:
+                req.add_header("Cookie", f".ROBLOSECURITY={cookie}")
+            with urllib.request.urlopen(req, timeout=12) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            rows = data.get("data", [])
+            total_seen += len(rows)
+            for s in rows:
+                jid = s.get("id")
+                if not jid:
+                    continue
+                # 'playing' is NOT the live count on this endpoint (it equals
+                # maxPlayers on nearly every server); the real occupancy is the
+                # length of 'playerTokens'. Fall back only if tokens are absent.
+                mx = (s.get("maxPlayers") or s.get("maxPlayerCount")
+                      or s.get("capacity") or 0)
+                mx = int(mx or 0)
+                if mx <= 0:
+                    mx = DEFAULT_SERVER_CAP
+                toks = s.get("playerTokens")
+                if isinstance(toks, list):
+                    pl = len(toks)
+                else:
+                    pl = s.get("playing")
+                    if pl is None:
+                        pl = s.get("playerCount") or 0
+                pl = int(pl or 0)
+                free = mx - pl
+                # playerTokens is only a SAMPLE of connected players, so a small
+                # count doesn't prove the server is open — but a count at/above
+                # capacity definitely means full. Require a real gap so we don't
+                # keep picking servers that are actually full and bounce the
+                # join into matchmaking (which caused same-server collisions).
+                if free < max(2, min_free):
+                    rej_full += 1
+                    continue
+                ping = s.get("ping")
+                # Roblox's listed ping is frequently bogus (we've seen 2000+ ms),
+                # so treat absurd values as "unknown" rather than sorting on them.
+                if isinstance(ping, (int, float)) and 0 < ping < 400:
+                    rated.append((float(ping), free, str(jid)))
+                else:
+                    unrated.append((free, str(jid)))
+            cursor = data.get("nextPageCursor") or ""
+            pages += 1
+            if not cursor:
+                break
+    except urllib.error.HTTPError as e:
+        if log:
+            log(f"server list HTTP {e.code} (the game may hide its server list, "
+                f"or the cookie was rejected).")
+    except Exception as e:
+        if log:
+            log(f"server list fetch failed: {type(e).__name__}.")
+
+    # Order PRIMARILY by lowest ping. Among servers with a real ping value, keep
+    # only ones with at least `min_free` slots when we have enough of them (so we
+    # still avoid near-full servers that bounce joins into matchmaking), but
+    # never sacrifice ping just to grab an emptier server — that was the bug that
+    # produced 200 ms picks. Free slots is only a tiebreaker for equal ping.
+    rated.sort(key=lambda t: (t[0], -t[1]))    # ping asc, then most-empty
+    roomy_rated = [t for t in rated if t[1] >= min_free]
+    use = roomy_rated if len(roomy_rated) >= want else rated
+    unrated.sort(key=lambda t: -t[0])          # most-empty first (no ping info)
+    result = [jid for _, _, jid in use] + [jid for _, jid in unrated]
+
+    if log:
+        if use:
+            best = int(use[0][0]) if isinstance(use[0], tuple) and len(use[0]) == 3 else None
+            worst = int(use[-1][0]) if isinstance(use[-1], tuple) and len(use[-1]) == 3 else None
+            png = (f", ping {best}–{worst} ms" if best is not None else "")
+        else:
+            png = ""
+        log(f"server list: saw {total_seen}, {len(result)} joinable "
+            f"({len(roomy_rated)} roomy+rated, {rej_full} full){png}.")
+    return result
+
+
+def _interruptible_sleep(seconds: float, stop=None) -> bool:
+    """Sleep in small slices, checking the stop callable between them. Returns
+    True if a stop was requested (so callers can abort), False if it slept the
+    full duration. Keeps network-probe pauses from blocking a Stop request."""
+    end = time.time() + max(0.0, seconds)
+    while time.time() < end:
+        try:
+            if stop and stop():
+                return True
+        except Exception:
+            pass
+        time.sleep(min(0.1, end - time.time()) if end > time.time() else 0)
+    return bool(stop and stop()) if stop else False
+
+
+def fetch_presence(user_ids: list[int], cookie: str) -> dict[int, str]:
+    """Return {userId: gameId} for the accounts that are currently in-game.
+
+    The presence API reports the ACTUAL server (gameId / jobId) each user is in
+    — this is ground truth, unlike the server we *requested* at launch (Roblox
+    can silently reroute a join into matchmaking). Used to detect when two
+    accounts ended up in the same server. Best-effort: returns {} on failure.
+    """
+    out: dict[int, str] = {}
+    ids = [int(u) for u in user_ids if u]
+    if not ids:
+        return out
+    url = "https://presence.roblox.com/v1/presence/users"
+    body = json.dumps({"userIds": ids}).encode()
+
+    def _try(token):
+        resp = _post(url, cookie, token, body)
+        return json.loads(resp.read().decode("utf-8", "ignore"))
+
+    data = None
+    try:
+        data = _try(None)
+    except urllib.error.HTTPError as e:
+        tok = e.headers.get("x-csrf-token")
+        if tok:
+            try:
+                data = _try(tok)
+            except Exception:
+                return out
+        else:
+            return out
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+    for p in data.get("userPresences", []):
+        # userPresenceType 2 == InGame; gameId is the server instance (jobId)
+        if p.get("userPresenceType") == 2:
+            uid = p.get("userId")
+            gid = p.get("gameId")
+            if uid and gid:
+                out[int(uid)] = str(gid)
+    return out
 
 
 def detect_last_place() -> str | None:
@@ -970,7 +1135,6 @@ class _IosSwitch(ctk.CTkFrame):
                 self._on_color if self._value == "on" else self._off_color)
 
 
-
 # ------------------------------------------------------------------- app ---
 
 class App(ctk.CTk):
@@ -1050,6 +1214,16 @@ class App(ctk.CTk):
         self.joinserver_enabled = bool(self.cfg.get("joinserver_on", False))
         self._joinserver_url = self.cfg.get("joinserver_url", "")
         self._join_cache = {"url": "", "place": None, "instance": None, "err": None}
+        # different-servers: spread accounts across distinct public servers
+        self.diffserver_enabled = bool(self.cfg.get("diffserver_on", False))
+        self._diffserver_pool: list[str] = []   # available job IDs (most-empty first)
+        self._diffserver_assigned: dict[int, str] = {}  # uid -> jobId in use
+        self._diffserver_place: str | None = None       # place the pool is for
+        # collision detection: how many times we've bumped each account off a
+        # shared server, so we don't kick the same one forever
+        self._diff_collision_bumps: dict[int, int] = {}
+        self._last_presence_check = 0.0
+        self._all_cookies: list[str] = []   # account cookies (full-check rotation)
         # bridge + animation timing
         self._last_state_pub = 0.0
         self._live_global_kill = 20
@@ -1086,6 +1260,7 @@ class App(ctk.CTk):
         self.after(900, self._ensure_visible)     # safety: never stay invisible
         self.after(100, self._pump)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
 
     # ---------------------------------------------------------- accounts --
     def _decrypt_accounts(self) -> None:
@@ -1446,6 +1621,7 @@ class App(ctk.CTk):
         wrap = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=1)
+        self._setup_scroll = wrap          # reference to the scrollable setup frame
 
         def sw(parent, text, cmd, **kw):
             """Create an animated iOS-style toggle using _IosSwitch."""
@@ -1524,6 +1700,24 @@ class App(ctk.CTk):
         self.joinserver_status = ctk.CTkLabel(r3, text="", font=self.f_small,
                                               text_color=MUTED)
         self.joinserver_status.pack(side="left", padx=12)
+
+        # ── DIFFERENT SERVERS ─────────────────────────────────────────────
+        self._section(wrap, "DIFFERENT SERVERS")
+        c = card(wrap)
+        r = row(c)
+        ctk.CTkLabel(r, text="Different servers", font=self.f_base,
+                     text_color=TEXT).pack(side="left", expand=True, anchor="w")
+        self.diffserver_switch = sw(r, "", self._on_diffserver_toggle)
+        self.diffserver_switch.pack(side="right")
+        if self.diffserver_enabled:
+            self.diffserver_switch.select()
+        divider(c)
+        ctk.CTkLabel(
+            c, text="Put each account in its own server instead of letting "
+            "them land together. Pulls the live public server list and gives "
+            "every account a different one. (Can't be used with Join server.)",
+            font=self.f_small, text_color=MUTED, justify="left",
+            wraplength=560, anchor="w").pack(fill="x", padx=14, pady=(2, 12))
 
         # ── REJOIN DELAY ──────────────────────────────────────────────────
         self._section(wrap, "DEFAULT REJOIN DELAY")
@@ -1866,6 +2060,15 @@ class App(ctk.CTk):
         self.joinserver_enabled = self.joinserver_switch.get() in ("on", 1, True)
         self._flash_switch(self.joinserver_switch)
         if self.joinserver_enabled:
+            # mutually exclusive with different-servers
+            if getattr(self, "diffserver_enabled", False):
+                self.diffserver_enabled = False
+                try:
+                    self.diffserver_switch.deselect()
+                except Exception:
+                    pass
+                self._append_log("Different servers turned off (Join server "
+                                 "can't be used at the same time).")
             self._resolve_join_async()    # warm the cache so START is instant
         else:
             self.joinserver_status.configure(text="")
@@ -1913,6 +2116,30 @@ class App(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_diffserver_toggle(self) -> None:
+        self.diffserver_enabled = self.diffserver_switch.get() in ("on", 1, True)
+        self._flash_switch(self.diffserver_switch)
+        if self.diffserver_enabled:
+            # mutually exclusive with join-server (one spreads, one gathers)
+            if self.joinserver_enabled:
+                self.joinserver_enabled = False
+                try:
+                    self.joinserver_switch.deselect()
+                    self.joinserver_status.configure(text="")
+                except Exception:
+                    pass
+                self._append_log("Join server turned off (different servers "
+                                 "can't be used at the same time).")
+            # reset the pool so the next START fetches a fresh server list
+            self._diffserver_pool = []
+            self._diffserver_assigned = {}
+            self._diffserver_place = None
+            self._append_log("Different servers ON — each account will join "
+                             "its own server.")
+        else:
+            self._append_log("Different servers OFF.")
+        self._save_settings()
+
     def _apply_layout_now(self) -> None:
         """Immediately tile or stack the currently-monitored windows."""
         hwnds = []
@@ -1952,6 +2179,7 @@ class App(ctk.CTk):
                 place, inst = js_place, js_inst
             else:
                 place = parse_place_id(a.get("place")) or default_place
+                # different-servers mode lets Roblox matchmake (no forced server)
                 inst = None
             if not place:
                 continue
@@ -2014,6 +2242,7 @@ class App(ctk.CTk):
                 "tile": bool(self.tile_enabled),
                 "detect_open": bool(self.detect_open_enabled),
                 "join_server": bool(self.joinserver_enabled),
+                "diff_server": bool(self.diffserver_enabled),
                 "join_server_url": self._joinserver_url or "",
                 "global_rejoin_delay": self.delay_entry.get().strip() or "60",
                 "global_kill_cooldown": self.kill_cd_entry.get().strip() or "20",
@@ -2085,6 +2314,12 @@ class App(ctk.CTk):
         if action == "detect_open":
             return set_switch(self.detect_open_switch, "detect_open_enabled",
                               self._on_detect_open_toggle)
+        if action == "diff_server":
+            return set_switch(self.diffserver_switch, "diffserver_enabled",
+                              self._on_diffserver_toggle)
+        if action == "join_server":
+            return set_switch(self.joinserver_switch, "joinserver_enabled",
+                              self._on_joinserver_toggle)
 
         if action == "account":      # enable/disable an account in the menu
             a = self._account_by_name(user)
@@ -2536,7 +2771,8 @@ class App(ctk.CTk):
         for uid, uname in accounts:
             row = ctk.CTkFrame(self.dash, fg_color="transparent")
             row.pack(fill="x", padx=8, pady=1)
-            name_l = ctk.CTkLabel(row, text=uname, font=self.f_small,
+            disp = uname if len(uname) <= 15 else uname[:14] + "…"
+            name_l = ctk.CTkLabel(row, text=disp, font=self.f_small,
                                   text_color=TEXT, width=120, anchor="w")
             name_l.pack(side="left")
             state_l = ctk.CTkLabel(row, text="starting…", font=self.f_small,
@@ -2826,14 +3062,105 @@ class App(ctk.CTk):
         if dc and dc.get("url"):
             discord_notify(dc["url"], dc.get("name", ""), dc.get("avatar", ""), msg)
 
+    def _check_server_collisions(self, rt: dict, emit, now: float) -> None:
+        """When 'different servers' is on, ask Roblox's presence API which server
+        each running account is ACTUALLY in (Roblox can silently reroute a join
+        into matchmaking, landing two accounts together). If two share a server,
+        kick one and let it rejoin into a different one. Bounded per account so
+        we never kick the same one endlessly when no other server is available."""
+        if not (self.diffserver_enabled and not self.joinserver_enabled):
+            return
+        if now - self._last_presence_check < 12:      # gentle on the API
+            return
+        running = [(uid, st) for uid, st in rt.items()
+                   if st.get("monitored") and st["state"] == "running"
+                   and st.get("pid")]
+        if len(running) < 2:
+            return
+        self._last_presence_check = now
+        # Query presence using EACH account's own cookie. An account can always
+        # see its own gameId (server), whereas one account often can't see
+        # another's if their join privacy isn't public — so per-account queries
+        # are far more reliable than asking one cookie about everyone.
+        presence: dict[int, str] = {}
+        for uid, st in running:
+            ck = st["acc"].get("cookie")
+            if not ck:
+                continue
+            p = fetch_presence([uid], ck)
+            if uid in p:
+                presence[uid] = p[uid]
+        if not presence:
+            return
+        # group running accounts by the server they're actually in
+        by_server: dict[str, list[int]] = {}
+        for uid, _ in running:
+            gid = presence.get(uid)
+            if gid:
+                by_server.setdefault(gid, []).append(uid)
+
+        for gid, uids in by_server.items():
+            if len(uids) < 2:
+                continue
+            # Randomly choose ONE account to KEEP on this server; the rest get
+            # bumped to different servers. With two accounts that's a 50/50 pick
+            # of which one is killed (rather than always sparing the first).
+            keep = random.choice(uids)
+            for uid in uids:
+                if uid == keep:
+                    continue
+                bumps = self._diff_collision_bumps.get(uid, 0)
+                if bumps >= 6:
+                    emit("log", f"⚠️ {rt[uid]['acc']['username']} keeps landing "
+                                f"in a shared server — leaving it (no distinct "
+                                f"server seems available).")
+                    continue
+                self._diff_collision_bumps[uid] = bumps + 1
+                st = rt[uid]
+                # release its current assignment so it isn't reused, then rejoin
+                self._diffserver_assigned.pop(uid, None)
+                if st["pid"]:
+                    kill_pid(st["pid"])
+                st["state"] = "waiting"
+                st["intentional"] = True       # not a crash
+                st["rejoin_at"] = now + max(3, int(st["acc"]["rdelay"]))
+                emit("log", f"⚠️ {st['acc']['username']} shared a server with "
+                            f"another account — moving it to a different one.")
+                self._notify(f"🔀 {st['acc']['username']} was sharing a server; "
+                             f"moving it to a different one.")
+
+
     def _launch_account(self, acc: dict, place_id: str
                         ) -> tuple[int | None, str | None]:
+        # Decide the exact server target for THIS launch, explicitly, every
+        # time — never inherit a stale rinstance from a previous launch/mode.
+        inst = None
+        if self.joinserver_enabled:
+            inst = acc.get("rinstance")          # shared-server (join link) mode
+        else:
+            # Different-servers AND plain mode both launch via Roblox's own
+            # open matchmaking (request=RequestGame, no forced server). For
+            # different-servers we DON'T pick a specific server here: Roblox's
+            # matchmaking never drops you into a full server (forcing a specific
+            # one from the public list did, because that list's fullness data is
+            # unreliable). After each account joins we read the server it
+            # actually landed in (presence API) and the collision corrector
+            # relaunches any that ended up sharing a server.
+            inst = None
+            acc["rinstance"] = None
         ticket = get_auth_ticket(acc["cookie"])
         if not ticket:
             return None, "auth failed (cookie may be expired)"
+        # stable browser-tracker id per account (RAM assigns one per account so
+        # Roblox can track that account's instance consistently)
+        btid = acc.get("_btid")
+        if not btid:
+            btid = random.randint(100_000_000_000, 999_999_999_999)
+            acc["_btid"] = btid
         before = roblox_pids()
         try:
-            os.startfile(build_launch_uri(ticket, place_id, acc.get("rinstance")))
+            os.startfile(build_launch_uri(ticket, place_id, inst,
+                                          browser_tracker_id=btid))
         except Exception as e:
             return None, f"launch error: {e}"
         deadline = time.time() + 60
@@ -2906,6 +3233,9 @@ class App(ctk.CTk):
                     st["open_since"] = time.time()
                     st["intentional"] = False
                     emit("log", f"{st['acc']['username']} is in (pid {pid}). ✓")
+                    if (self.diffserver_enabled and not self.joinserver_enabled):
+                        emit("log", f"   ↳ {st['acc']['username']} joined via "
+                                    f"matchmaking — will verify its server next.")
                     self._notify(f"✅ {st['acc']['username']} launched.")
                     hwnd = find_window_for_pid(pid)
                     if hwnd:
@@ -3046,6 +3376,32 @@ class App(ctk.CTk):
                     acc["rinstance"] = inst
                 emit("log", f"Join server → place {place}"
                             + (f", server {inst[:8]}…" if inst else " (open server)"))
+
+            # Different-servers mode: we DON'T pre-pick servers anymore. Each
+            # account launches via Roblox's open matchmaking (which never drops
+            # you into a full server). After they join we read each one's actual
+            # server via the presence API and the collision corrector relaunches
+            # any that ended up sharing a server. This avoids the full-server
+            # joins that came from forcing servers off the unreliable public list.
+            if self.diffserver_enabled and not self.joinserver_enabled:
+                place = None
+                for a in accts:
+                    p = parse_place_id(a.get("rplace") or a.get("place") or "")
+                    if p:
+                        place = p
+                        break
+                if not place:
+                    place = parse_place_id(self._diffserver_place or "")
+                # reset collision bookkeeping from any previous run
+                self._diffserver_assigned = {}
+                self._diffserver_pool = []
+                self._diffserver_place = place
+                self._diff_collision_bumps = {}
+                self._last_presence_check = time.time() + 8   # let joins settle
+                self._all_cookies = [a["cookie"] for a in accts
+                                     if a.get("cookie")]
+                emit("log", "Different servers: letting Roblox matchmake each "
+                            "account, then checking they're on separate servers.")
 
             emit("log", f"Starting {len(accts)} account(s). "
                         "Multi-instance lock held.")
@@ -3281,6 +3637,9 @@ class App(ctk.CTk):
                         emit("log", f"Rejoining {acc['username']}…")
                         self._begin_launch(uid, acc, emit)
 
+                # ---- different-servers: detect & break up shared servers -----
+                self._check_server_collisions(rt, emit, now)
+
                 # ---- recompute the steady-state status pill each cycle so it
                 # ---- never gets stuck on a stale transient message ----------
                 self._emit_live_status(rt, emit)
@@ -3317,6 +3676,11 @@ class App(ctk.CTk):
         if hasattr(self, "joinserver_entry"):
             self._joinserver_url = self.joinserver_entry.get().strip()
         self.cfg["joinserver_on"] = bool(self.joinserver_enabled)
+        self.cfg["diffserver_on"] = bool(self.diffserver_enabled)
+        # region/ping features were removed (Roblox rate-limits the only APIs
+        # that could power them) — drop any stale keys from older configs
+        for _k in ("regions", "region_filter", "region", "max_ping"):
+            self.cfg.pop(_k, None)
         self.cfg["joinserver_url"] = self._joinserver_url
         # discord
         url, name, avatar = self._gather_discord()
