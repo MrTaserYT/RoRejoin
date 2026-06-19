@@ -2,7 +2,7 @@ V2.12: improved different servers (faster and works good). Added new feature "Ki
 
 
 
-**RoRejoin** is a Windows desktop app for managing multiple Roblox accounts simultaneously. It watches your running Roblox instances in the background and automatically relaunches any that crash or get disconnected — so you never have to babysit your sessions.
+**RoRejoin** is the ultimate tool for Roblox auto farms. It a Windows desktop app for managing multiple Roblox accounts simultaneously. It watches your running Roblox instances in the background and automatically relaunches any that crash or get disconnected — so you never have to babysit your sessions.
 
 **Features**
 - Multi-account support with per-account place and timing overrides
