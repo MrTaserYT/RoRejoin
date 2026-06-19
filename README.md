@@ -1,4 +1,4 @@
-V2.1 (alpha) is out, new feature: different servers (very slow and broken at the moment)
+V2.12: improved different servers (faster and works good). Added new feature "Kick detect" detects if an account got kicked or tped to a wrong game Added "clear logs" and "clear cache" for performance.
 
 
 
