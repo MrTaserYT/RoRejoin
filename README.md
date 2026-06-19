@@ -1,4 +1,5 @@
-V2.12: improved different servers (faster and works good). Added new feature "Kick detect" detects if an account got kicked or tped to a wrong game Added "clear logs" and "clear cache" for performance.
+V2.21 (last probably)
+Added executor detect for fun, just tells you what executor you're using and rates it.
 
 
 
