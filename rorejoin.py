@@ -26,6 +26,7 @@ DevTools (F12) -> Application -> Cookies -> .ROBLOSECURITY.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import ctypes
 import json
 import math
@@ -50,6 +51,19 @@ APP_NAME = "RoRejoin"
 ROBLOX_EXE = "RobloxPlayerBeta.exe"
 POLL_SECONDS = 2.0
 LAUNCH_STAGGER = 8          # seconds between sequential account launches
+# different-servers collision detection cadence
+PRESENCE_INTERVAL = 3.0    # how often to re-check which server each acct is in
+PRESENCE_SETTLE = 6.0      # grace after a (re)join before an acct is checked
+                           # (lets Roblox presence catch up so we don't act on
+                           # a stale server and double-kick)
+# error-264 avoidance: after a kill, wait until Roblox stops reporting the
+# account in-game before relaunching (a fresh login while the old session is
+# still alive server-side triggers "Disconnected (error 264)")
+LEAVE_POLL = 2.5           # how often to re-check whether a killed acct has left
+LEAVE_MAX_WAIT = 40.0      # …but relaunch anyway after this, so we never hang
+# kick detection: process alive but no longer in-game = likely kicked
+KICK_GRACE = 10.0          # not-in-game must persist this long to count as a kick
+KICK_POLL = 4.0            # how often to poll presence for kick detection
 CREATE_NO_WINDOW = 0x08000000
 DEFAULT_SERVER_CAP = 50    # assumed max players when the API omits capacity
 
@@ -880,6 +894,58 @@ def fetch_presence(user_ids: list[int], cookie: str) -> dict[int, str]:
     return out
 
 
+def presence_detail(user_id: int, cookie: str) -> tuple[str, set[str], str | None]:
+    """One-account presence with a definite state, which place it's in, AND the
+    server (gameId/jobId):
+        ("ingame", {placeId, rootPlaceId}, gameId)  – in a game right now
+        ("out",    set(),                  None)     – online/away/offline
+        ("unknown", set(),                 None)     – lookup failed; callers must
+                    NOT treat this as 'left'/'wrong game'/'collision'.
+    The place set holds both placeId and rootPlaceId (as strings) so callers can
+    match a configured place whether it's a root or a sub-place. gameId is the
+    server instance, used to detect two accounts sharing a server."""
+    ids = [int(user_id)] if user_id else []
+    if not ids:
+        return "unknown", set(), None
+    url = "https://presence.roblox.com/v1/presence/users"
+    body = json.dumps({"userIds": ids}).encode()
+
+    def _try(token):
+        resp = _post(url, cookie, token, body)
+        return json.loads(resp.read().decode("utf-8", "ignore"))
+
+    data = None
+    try:
+        data = _try(None)
+    except urllib.error.HTTPError as e:
+        tok = e.headers.get("x-csrf-token")
+        if not tok:
+            return "unknown", set(), None
+        try:
+            data = _try(tok)
+        except Exception:
+            return "unknown", set(), None
+    except Exception:
+        return "unknown", set(), None
+    if not isinstance(data, dict):
+        return "unknown", set(), None
+    for p in data.get("userPresences", []):
+        if p.get("userId") and int(p["userId"]) == int(user_id):
+            # 2 == InGame; anything else (0 offline, 1 online, 3 studio) = out
+            if p.get("userPresenceType") != 2:
+                return "out", set(), None
+            places = {str(p[k]) for k in ("placeId", "rootPlaceId")
+                      if p.get(k)}
+            gid = p.get("gameId")
+            return "ingame", places, (str(gid) if gid else None)
+    return "out", set(), None
+
+
+def presence_state(user_id: int, cookie: str) -> str:
+    """Back-compat thin wrapper: just the state, ignoring place/server."""
+    return presence_detail(user_id, cookie)[0]
+
+
 def detect_last_place() -> str | None:
     try:
         files = sorted(LOG_DIR.glob("*.log"), key=lambda f: -f.stat().st_mtime)
@@ -1185,6 +1251,8 @@ class App(ctk.CTk):
         self.kill_now_event = threading.Event()
         # which accounts the next Kill Now targets; None = use watch selection
         self.kill_now_ids: set[int] | None = None
+        # accounts the bot asked to rejoin (restart); the worker drains this set
+        self._rejoin_requests: set[int] = set()
 
         # runtime snapshots
         self.acct_stats: dict[int, dict] = {}
@@ -1210,6 +1278,7 @@ class App(ctk.CTk):
         self.tile_enabled = bool(self.cfg.get("tile_windows", False))
         # adopt already-open Roblox clients instead of launching new ones
         self.detect_open_enabled = bool(self.cfg.get("detect_open", False))
+        self.kickdetect_enabled = bool(self.cfg.get("kickdetect_on", False))
         # join-server-from-share-link
         self.joinserver_enabled = bool(self.cfg.get("joinserver_on", False))
         self._joinserver_url = self.cfg.get("joinserver_url", "")
@@ -1219,13 +1288,18 @@ class App(ctk.CTk):
         self._diffserver_pool: list[str] = []   # available job IDs (most-empty first)
         self._diffserver_assigned: dict[int, str] = {}  # uid -> jobId in use
         self._diffserver_place: str | None = None       # place the pool is for
-        # collision detection: how many times we've bumped each account off a
-        # shared server, so we don't kick the same one forever
-        self._diff_collision_bumps: dict[int, int] = {}
         self._last_presence_check = 0.0
+        self._last_kick_check = 0.0         # kick-detection poll throttle
+        self._presence_snap = None          # per-cycle shared presence snapshot
+        self._presence_snap_t = -1.0        # timestamp the snapshot was taken
+        self._last_pids: set[int] = set()   # current Roblox pids (worker-updated)
         self._all_cookies: list[str] = []   # account cookies (full-check rotation)
         # bridge + animation timing
         self._last_state_pub = 0.0
+        self._last_slow_refresh = 0.0    # throttle live-target/discord refresh
+        # auto-maintenance timers (reset when their interval fires)
+        self._last_log_clear = time.time()
+        self._last_cache_clear = time.time()
         self._live_global_kill = 20
         self._cmd_results: dict[str, dict] = {}
         self._anim_t0 = time.time()
@@ -1236,6 +1310,11 @@ class App(ctk.CTk):
         self._switch_flash_id = 0
         self._monitored_pids: list[int] = []   # worker publishes for live layout
         self._recent_log: list[str] = []        # rolling buffer for bot /log
+        # log-box trimming: cap the on-screen Text widget so it never grows
+        # without bound (which slowly lags the whole UI over a long session)
+        self._log_lines = 0
+        self._LOG_MAX = 600      # trim once it exceeds this many lines
+        self._LOG_KEEP = 400     # ...back down to this many
 
         # per-account entry widget refs (rebuilt on render)
         self.sel_vars: dict[int, ctk.StringVar] = {}
@@ -1274,6 +1353,10 @@ class App(ctk.CTk):
                 "user_id": a.get("user_id"),
                 "username": a.get("username", "unknown"),
                 "cookie": cookie,
+                # keep the original encrypted blob so an account whose cookie
+                # couldn't be decrypted on this machine isn't silently dropped
+                # when settings are next saved
+                "cookie_enc": a.get("cookie_enc", ""),
                 "place": a.get("place", ""),
                 "delay": a.get("delay", ""),
                 "killmin": a.get("killmin", ""),
@@ -1750,6 +1833,26 @@ class App(ctk.CTk):
             font=self.f_small, text_color=MUTED, justify="left",
             wraplength=560, anchor="w").pack(fill="x", padx=14, pady=(2, 12))
 
+        # ── KICK DETECTION ────────────────────────────────────────────────
+        self._section(wrap, "KICK DETECTION")
+        c = card(wrap)
+        r = row(c)
+        ctk.CTkLabel(r, text="Detect kicks & rejoin", font=self.f_base,
+                     text_color=TEXT).pack(side="left", expand=True, anchor="w")
+        self.kickdetect_switch = sw(r, "", self._on_kickdetect_toggle)
+        self.kickdetect_switch.pack(side="right")
+        if self.kickdetect_enabled:
+            self.kickdetect_switch.select()
+        divider(c)
+        ctk.CTkLabel(
+            c, text="Watches whether each account is still in the correct game. "
+            "If you get kicked or disconnected (the client stays open but you're "
+            "no longer in-game), OR the account ends up in a different game than "
+            "the one you set, RoRejoin closes it and rejoins the right game "
+            "automatically. Works on its own — you don't need Auto Kill on.",
+            font=self.f_small, text_color=MUTED, justify="left",
+            wraplength=560, anchor="w").pack(fill="x", padx=14, pady=(2, 12))
+
         # ── WINDOW LAYOUT ─────────────────────────────────────────────────
         self._section(wrap, "WINDOW LAYOUT")
         c = card(wrap)
@@ -1858,6 +1961,48 @@ class App(ctk.CTk):
         self.log_box.grid(row=3, column=0, sticky="nsew")
         self.log_box.configure(state="disabled")
         tab.grid_rowconfigure(3, weight=1)
+
+        # --- auto-maintenance row: clear logs / clear cache on a timer --------
+        maint = ctk.CTkFrame(tab, fg_color="transparent")
+        maint.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        maint.grid_columnconfigure(0, weight=1)
+        maint.grid_columnconfigure(1, weight=1)
+
+        logcol = ctk.CTkFrame(maint, fg_color="transparent")
+        logcol.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkLabel(logcol, text="Auto-clear logs", font=self.f_small,
+                     text_color=TEXT2, anchor="w").pack(side="left")
+        self.logclear_entry = ctk.CTkEntry(
+            logcol, width=52, justify="center", font=self.f_small,
+            fg_color=FIELD, border_color=BORDER, text_color=TEXT)
+        self.logclear_entry.pack(side="left", padx=(8, 4))
+        ctk.CTkLabel(logcol, text="min  (0 = off)", font=self.f_small,
+                     text_color=MUTED, anchor="w").pack(side="left")
+        self.logclear_entry.bind("<FocusOut>", lambda e: self._save_settings())
+        self.logclear_entry.bind("<Return>", lambda e: self._save_settings())
+
+        cachecol = ctk.CTkFrame(maint, fg_color="transparent")
+        cachecol.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(6, 0))
+        ctk.CTkLabel(cachecol, text="Auto-clear cache", font=self.f_small,
+                     text_color=TEXT2, anchor="w").pack(side="left")
+        self.cacheclear_entry = ctk.CTkEntry(
+            cachecol, width=52, justify="center", font=self.f_small,
+            fg_color=FIELD, border_color=BORDER, text_color=TEXT)
+        self.cacheclear_entry.pack(side="left", padx=(8, 4))
+        ctk.CTkLabel(cachecol, text="min  (0 = off)", font=self.f_small,
+                     text_color=MUTED, anchor="w").pack(side="left")
+        self.cacheclear_entry.bind("<FocusOut>", lambda e: self._save_settings())
+        self.cacheclear_entry.bind("<Return>", lambda e: self._save_settings())
+        # seed both fields from saved config (default 0 = off)
+        self.logclear_entry.insert(0, str(self.cfg.get("log_clear_min", 0)))
+        self.cacheclear_entry.insert(0, str(self.cfg.get("cache_clear_min", 0)))
+        ctk.CTkLabel(
+            maint,
+            text="Frees memory during long sessions. Cache = temporary runtime "
+                 "data only — your accounts and settings are never touched.",
+            font=self.f_small, text_color=MUTED, anchor="w",
+            wraplength=520, justify="left"
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
 
     # --------------------------------------------------- account rendering -
@@ -2007,21 +2152,37 @@ class App(ctk.CTk):
                 status.configure(text="Paste a cookie first.", text_color=BAD)
                 return
             status.configure(text="Checking cookie…", text_color=WARN)
-            dlg.update_idletasks()
-            uid, uname = get_account_info(cookie)
-            if not uid:
-                status.configure(text="Cookie rejected — expired or invalid.",
-                                 text_color=BAD)
-                return
-            self._sync_account_fields()
-            self.accounts = [a for a in self.accounts if a["user_id"] != uid]
-            self.accounts.append({"user_id": uid, "username": uname or str(uid),
-                                  "cookie": cookie, "place": "", "delay": "",
-                                  "killmin": ""})
-            self._persist_accounts()
-            self._refresh_account_list()
-            self._append_log(f"Added account: {uname} ({uid}).")
-            dlg.destroy()
+
+            def finish(uid, uname):
+                # back on the UI thread (via .after) — safe to touch widgets
+                if not uid:
+                    status.configure(text="Cookie rejected — expired or invalid.",
+                                     text_color=BAD)
+                    return
+                self._sync_account_fields()
+                self.accounts = [a for a in self.accounts
+                                 if a["user_id"] != uid]
+                self.accounts.append({"user_id": uid,
+                                      "username": uname or str(uid),
+                                      "cookie": cookie, "place": "", "delay": "",
+                                      "killmin": ""})
+                self._persist_accounts()
+                self._refresh_account_list()
+                self._append_log(f"Added account: {uname} ({uid}).")
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+
+            def work():
+                uid, uname = get_account_info(cookie)
+                # marshal the result back onto the UI thread
+                try:
+                    self.after(0, lambda: finish(uid, uname))
+                except Exception:
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
 
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
         btns.pack(fill="x", padx=18, pady=16, side="bottom")
@@ -2055,6 +2216,16 @@ class App(ctk.CTk):
                 f"client(s) on start ({n} open right now) instead of launching.")
         else:
             self._append_log("Detect open clients OFF — accounts launch normally.")
+
+    def _on_kickdetect_toggle(self) -> None:
+        self.kickdetect_enabled = self.kickdetect_switch.get() in ("on", 1, True)
+        self._flash_switch(self.kickdetect_switch)
+        self._save_settings()
+        if self.kickdetect_enabled:
+            self._append_log("Kick detection ON — if an account gets kicked or "
+                             "disconnected, it'll be closed and rejoined.")
+        else:
+            self._append_log("Kick detection OFF.")
 
     def _on_joinserver_toggle(self) -> None:
         self.joinserver_enabled = self.joinserver_switch.get() in ("on", 1, True)
@@ -2241,6 +2412,7 @@ class App(ctk.CTk):
                 "sync_kill": bool(self.synckill_enabled),
                 "tile": bool(self.tile_enabled),
                 "detect_open": bool(self.detect_open_enabled),
+                "kick_detect": bool(self.kickdetect_enabled),
                 "join_server": bool(self.joinserver_enabled),
                 "diff_server": bool(self.diffserver_enabled),
                 "join_server_url": self._joinserver_url or "",
@@ -2314,6 +2486,9 @@ class App(ctk.CTk):
         if action == "detect_open":
             return set_switch(self.detect_open_switch, "detect_open_enabled",
                               self._on_detect_open_toggle)
+        if action == "kick_detect":
+            return set_switch(self.kickdetect_switch, "kickdetect_enabled",
+                              self._on_kickdetect_toggle)
         if action == "diff_server":
             return set_switch(self.diffserver_switch, "diffserver_enabled",
                               self._on_diffserver_toggle)
@@ -2420,6 +2595,17 @@ class App(ctk.CTk):
                 return True, "stopped watching"
             return True, f"already {'running' if running else 'stopped'}"
 
+        if action == "rejoin":
+            a = self._account_by_name(user)
+            if not a:
+                return False, f"no account '{user}'"
+            running = self.worker is not None and self.worker.is_alive()
+            if not running:
+                return False, "not watching — start the watcher first"
+            # hand the uid to the worker; it kills + relaunches on its next loop
+            self._rejoin_requests.add(a["user_id"])
+            return True, f"restarting {a['username']}"
+
         return False, f"unknown action '{action}'"
 
     # ------------------------------------------------------------ discord --
@@ -2446,15 +2632,24 @@ class App(ctk.CTk):
                 text="Enter a valid Discord webhook URL.", text_color=BAD)
             return
         self.discord_status.configure(text="Sending…", text_color=WARN)
-        self.update_idletasks()
-        ok, err = discord_send(url, name, avatar,
-                               "✅ RoRejoin webhook test — you're connected.")
-        if ok:
-            self._save_settings()
-            self.discord_status.configure(text="Sent! Check your channel.",
-                                          text_color=GOOD)
-        else:
-            self.discord_status.configure(text=err, text_color=BAD)
+
+        def finish(ok, err):
+            if ok:
+                self._save_settings()
+                self.discord_status.configure(text="Sent! Check your channel.",
+                                              text_color=GOOD)
+            else:
+                self.discord_status.configure(text=err, text_color=BAD)
+
+        def work():
+            ok, err = discord_send(url, name, avatar,
+                                   "✅ RoRejoin webhook test — you're connected.")
+            try:
+                self.after(0, lambda: finish(ok, err))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------- queue --
     def _emit(self, kind: str, payload=None) -> None:
@@ -2486,15 +2681,79 @@ class App(ctk.CTk):
                 pass
         self._tick_dashboard()
         self._tick_anim()
-        self._refresh_discord_runtime()
-        self._refresh_live_targets()
+        # These do real work (widget reads, regex, dict rebuilds / file writes).
+        # The pump runs ~12×/sec for smooth animation, but these only need to be
+        # roughly once a second — running them every tick was needless main-thread
+        # churn that added up to UI lag. _publish_state already self-throttles.
+        now = time.time()
+        if now - self._last_slow_refresh >= 1.0:
+            self._last_slow_refresh = now
+            self._refresh_discord_runtime()
+            self._refresh_live_targets()
+            self._run_auto_maintenance(now)
         self._publish_state()
         self.after(80, self._pump)
+
+    def _run_auto_maintenance(self, now: float) -> None:
+        """Periodically clear the on-screen log and/or transient caches, on the
+        intervals the user set. Frees memory on long sessions. Never touches
+        user data (accounts, delays, places, Discord settings)."""
+        log_min = self.cfg.get("log_clear_min", 0) or 0
+        if log_min and (now - self._last_log_clear) >= log_min * 60:
+            self._last_log_clear = now
+            self._clear_logs(auto=True)
+        cache_min = self.cfg.get("cache_clear_min", 0) or 0
+        if cache_min and (now - self._last_cache_clear) >= cache_min * 60:
+            self._last_cache_clear = now
+            self._clear_cache(auto=True)
+
+    def _clear_logs(self, auto: bool = False) -> None:
+        """Wipe the activity-log textbox (purely cosmetic/runtime — no data)."""
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.delete("1.0", "end")
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
+        self._log_lines = 0
+        if auto:
+            self._append_log("🧹 Logs auto-cleared (scheduled maintenance).")
+
+    def _clear_cache(self, auto: bool = False) -> None:
+        """Drop transient, rebuildable runtime data and reclaim memory. Does NOT
+        touch accounts, settings, or anything persisted to config."""
+        # rolling buffers / bot bridge scratch
+        self._recent_log = []
+        self._cmd_results = {}
+        # different-servers scratch (safe: rebuilt from presence on next loop)
+        self._diffserver_pool = []
+        # resolved join-link cache (re-resolved automatically when needed)
+        if not (self.worker and self.worker.is_alive()):
+            # only clear the join cache while idle, so a running session that
+            # depends on the resolved server isn't disturbed mid-flight
+            self._join_cache = {"url": "", "place": None,
+                                "instance": None, "err": None}
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if auto:
+            self._append_log("🧹 Cache cleared (scheduled maintenance).")
 
     def _append_log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{ts}]  {msg}\n")
+        # Trim the widget to a rolling window. A Tk Text widget gets steadily
+        # slower as its line count grows, so an unbounded log makes the whole
+        # UI laggy over a long session — keep only the most recent lines.
+        self._log_lines += 1
+        if self._log_lines > self._LOG_MAX:
+            # delete the oldest lines in one batch (cheaper than line-by-line)
+            drop = self._log_lines - self._LOG_KEEP
+            self.log_box.delete("1.0", f"{drop + 1}.0")
+            self._log_lines = self._LOG_KEEP
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
         # keep a short rolling buffer for the Discord /log command
@@ -2530,6 +2789,28 @@ class App(ctk.CTk):
                 pass
             self._faded_in = True
 
+    def _cfg_if_changed(self, widget, key: str, **props) -> None:
+        """Call widget.configure(**props) ONLY when the values differ from what
+        was last applied to this (widget, key). Tk's .configure() is a relatively
+        costly Tcl round-trip; the breathing/glow animations recompute colours
+        every frame but for a slow sine many frames round to the same hex, so
+        skipping the no-op calls keeps the menu snappy without changing how the
+        animation looks. Cache lives on the widget so it's auto-collected."""
+        cache = getattr(widget, "_anim_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                widget._anim_cache = cache
+            except Exception:
+                pass
+        if cache.get(key) == props:
+            return
+        cache[key] = props
+        try:
+            widget.configure(**props)
+        except Exception:
+            pass
+
     def _tick_anim(self) -> None:
         """Lightweight UI animations: pulsing run-dot, breathing wordmark,
         launching spinner, idle/active button glow + fading row flashes."""
@@ -2539,23 +2820,25 @@ class App(ctk.CTk):
 
             # breathing wordmark — always on, very subtle
             wm = (math.sin(t * 1.3) + 1) / 2
-            self.wm_ro.configure(text_color=lerp_hex(ACCENT, ACCENT_MID, wm))
+            self._cfg_if_changed(self.wm_ro, "tc",
+                                 text_color=lerp_hex(ACCENT, ACCENT_MID, wm))
 
             if running:
                 phase = (math.sin(t * 3.0) + 1) / 2
-                self.dot.configure(text_color=lerp_hex(ACCENT, ACCENT_SOFT, phase))
+                self._cfg_if_changed(self.dot, "tc",
+                                     text_color=lerp_hex(ACCENT, ACCENT_SOFT, phase))
                 # Kill Now breathes a red border while a session is live
                 kp = (math.sin(t * 2.6) + 1) / 2
-                self.kill_now_btn.configure(
-                    border_width=2,
+                self._cfg_if_changed(
+                    self.kill_now_btn, "bd", border_width=2,
                     border_color=lerp_hex(KILL_BG_HOVER, BAD, kp))
-                self.start_btn.configure(border_width=0)
+                self._cfg_if_changed(self.start_btn, "bd", border_width=0)
             else:
-                self.kill_now_btn.configure(border_width=0)
+                self._cfg_if_changed(self.kill_now_btn, "bd", border_width=0)
                 # soft breathing glow ring on the START button while idle
                 g = (math.sin(t * 2.2) + 1) / 2
-                self.start_btn.configure(
-                    border_width=2,
+                self._cfg_if_changed(
+                    self.start_btn, "bd", border_width=2,
                     border_color=lerp_hex(ACCENT_DARK, ACCENT_SOFT, g))
 
             # animated spinner for launching / rejoining accounts.
@@ -2571,6 +2854,9 @@ class App(ctk.CTk):
                 if s == "launching":
                     refs["state"].configure(text=f"{spin}  launching",
                                             text_color=ACCENT_SOFT)
+                elif s == "leaving":
+                    refs["state"].configure(text=f"{spin}  leaving",
+                                            text_color=WARN)
                 elif s == "waiting":
                     refs["state"].configure(text=f"{spin}  rejoining",
                                             text_color=WARN)
@@ -2812,7 +3098,7 @@ class App(ctk.CTk):
                 refs["state"].configure(text="● in game", text_color=GOOD)
                 jt = st.get("joined_at")
                 refs["up"].configure(text=fmt_dur(now - jt) if jt else "—")
-            elif state in ("launching", "waiting"):
+            elif state in ("launching", "waiting", "leaving"):
                 # animated spinner text is driven by _tick_anim (runs every
                 # 80ms); don't fight it here or the glyph will flicker.
                 refs["up"].configure(text="—")
@@ -2823,7 +3109,7 @@ class App(ctk.CTk):
             refs["lc"].configure(text=fmt_ago(st.get("last_crash")))
             # AUTO-KILL countdown
             ak, rk = st.get("open_since"), st.get("rkill")
-            if self.synckill_enabled and state in ("running", "waiting"):
+            if self.synckill_enabled and state in ("running", "waiting", "leaving"):
                 # simultaneous mode: ONE shared timer for everyone, independent
                 # of each account's uptime — all accounts show the same value
                 dl = self.sync_kill_deadline
@@ -2893,6 +3179,15 @@ class App(ctk.CTk):
             return max(1, min(720, int(self.kill_cd_entry.get().strip() or "20")))
         except (ValueError, AttributeError):
             return 20
+
+    @staticmethod
+    def _clean_int(raw, default: int = 0, lo: int = 0, hi: int = 10080) -> int:
+        """Parse a user-entered integer, clamped to [lo, hi]. Blank/garbage
+        falls back to default. Used for the auto-clear minute fields."""
+        try:
+            return max(lo, min(hi, int(str(raw).strip() or default)))
+        except (ValueError, TypeError):
+            return default
 
     def _toggle(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -3062,70 +3357,252 @@ class App(ctk.CTk):
         if dc and dc.get("url"):
             discord_notify(dc["url"], dc.get("name", ""), dc.get("avatar", ""), msg)
 
+    def _poll_departures(self, rt: dict, now: float) -> None:
+        """Parallel, throttled presence check for every account that's waiting
+        to relaunch (state 'waiting', past its rejoin time). Writes a per-account
+        '_left_ok' the transition reads, so _has_left_game never blocks the loop
+        with a network call (important when sync-kill puts many accounts here at
+        once)."""
+        due = []
+        for uid, st in rt.items():
+            if not st.get("monitored") or st["state"] != "waiting":
+                continue
+            if now < st.get("rejoin_at", 0):
+                continue                       # still in the rejoin-delay window
+            # If this is a NEW kill (rejoin_at changed since we last tracked it),
+            # drop any stale departure bookkeeping so we don't relaunch instantly
+            # on a previous "_left_ok". Detected by comparing the rejoin_at the
+            # deadline was based on.
+            if st.get("_leave_for") != st.get("rejoin_at"):
+                st["_leave_for"] = st.get("rejoin_at")
+                st.pop("_leave_deadline", None)
+                st.pop("_next_leave_poll", None)
+                st.pop("_leave_logged", None)
+                st["_left_ok"] = False
+            # process still alive → definitely not left; no need to poll
+            if st.get("pid") and st["pid"] in self._last_pids:
+                st["_left_ok"] = False
+                continue
+            if not st["acc"].get("cookie"):
+                st["_left_ok"] = True          # can't check — allow relaunch
+                continue
+            # hard deadline: stop waiting after LEAVE_MAX_WAIT
+            dl = st.get("_leave_deadline")
+            if dl is None:
+                dl = now + LEAVE_MAX_WAIT
+                st["_leave_deadline"] = dl
+            if now >= dl:
+                if not st.get("_leave_logged"):
+                    st["_leave_logged"] = True
+                    self._emit("log", f"{st['acc']['username']} — still shown "
+                                      f"in-game after {int(LEAVE_MAX_WAIT)}s; "
+                                      f"rejoining anyway.")
+                st["_left_ok"] = True
+                continue
+            if now < st.get("_next_leave_poll", 0):
+                continue                       # throttled; keep prior _left_ok
+            st["_next_leave_poll"] = now + LEAVE_POLL
+            due.append((uid, st["acc"]["cookie"]))
+        if not due:
+            return
+
+        def _one(pair):
+            uid, ck = pair
+            return uid, presence_state(uid, ck)
+
+        results: dict[int, str] = {}
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(8, max(1, len(due)))) as ex:
+                for uid, state in ex.map(_one, due):
+                    results[uid] = state
+        except Exception:
+            for uid, ck in due:
+                results[uid] = presence_state(uid, ck)
+        for uid, state in results.items():
+            # in-game → keep waiting; "out"/"unknown" → safe enough to relaunch
+            rt[uid]["_left_ok"] = (state != "ingame")
+
+    def _has_left_game(self, uid: int, st: dict, now: float) -> bool:
+        """True once it's safe to relaunch this killed/crashed account — i.e.
+        Roblox no longer reports it in-game (so a new login won't collide with a
+        still-live session and trigger error 264). The actual presence polling
+        happens in _poll_departures (parallel, throttled); this just reads the
+        result so it never blocks the watcher loop."""
+        if st.get("pid") and st["pid"] in self._last_pids:
+            return False               # OS process still alive → hasn't left
+        if not st["acc"].get("cookie"):
+            return True                # can't check — don't block the relaunch
+        # default False until the first poll result arrives (so we wait rather
+        # than risk an immediate 264-prone relaunch)
+        return bool(st.get("_left_ok", False))
+
+    def _running_presence(self, rt: dict, now: float) -> dict:
+        """Presence for every running account, fetched ONCE per cycle and shared
+        by kick-detection and collision-detection so we don't hammer the API with
+        duplicate polls (which would cause rate-limited 'unknown' results and
+        make both features flaky). Parallel, each with its own cookie. Memoised
+        for the current loop tick. Returns {uid: (state, places, game_id)}."""
+        if self._presence_snap_t == now and self._presence_snap is not None:
+            return self._presence_snap
+        cands = [(uid, st["acc"]["cookie"]) for uid, st in rt.items()
+                 if st.get("monitored") and st["state"] == "running"
+                 and st.get("pid") and st["acc"].get("cookie")]
+        snap: dict = {}
+        if cands:
+            def _one(pair):
+                uid, ck = pair
+                return uid, presence_detail(uid, ck)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(8, max(1, len(cands)))) as ex:
+                    for uid, detail in ex.map(_one, cands):
+                        snap[uid] = detail
+            except Exception:
+                for uid, ck in cands:
+                    snap[uid] = presence_detail(uid, ck)
+        self._presence_snap = snap
+        self._presence_snap_t = now
+        return snap
+
+    def _check_kicks(self, rt: dict, emit, now: float) -> None:
+        """Detect kicks/disconnects AND wrong-game: the client process is still
+        alive but the account is either no longer in ANY game, or it's in a
+        DIFFERENT game than the one configured for it. Only fires once the bad
+        state has persisted for KICK_GRACE seconds (and only after the join
+        settle window), so normal loading and brief teleport transitions don't
+        trip it. Independent of Auto Kill."""
+        if not self.kickdetect_enabled:
+            return
+        if now - self._last_kick_check < KICK_POLL:
+            return
+        # candidates: monitored, running, process alive, past the join-settle
+        # grace (during which presence legitimately isn't in-game yet)
+        cands = [(uid, st) for uid, st in rt.items()
+                 if st.get("monitored") and st["state"] == "running"
+                 and st.get("pid") and st["pid"] in self._last_pids
+                 and (now - (st.get("open_since") or now)) >= PRESENCE_SETTLE
+                 and st["acc"].get("cookie")]
+        if not cands:
+            return
+        self._last_kick_check = now
+        snap = self._running_presence(rt, now)
+
+        for uid, st in cands:
+            state, places, _gid = snap.get(uid, ("unknown", set(), None))
+            if state == "unknown":
+                continue                        # flaky lookup — never act on it
+            target = str(st["acc"].get("rplace") or "") or None
+
+            reason = None
+            if state == "out":
+                # not in any game — "out" is also normal while still loading, so
+                # only treat it as a kick once we've CONFIRMED it was in-game
+                if st.get("_was_ingame"):
+                    reason = "kicked/disconnected (client open, not in-game)"
+            elif state == "ingame":
+                if target and target not in places:
+                    # in the WRONG game. The PRESENCE_SETTLE grace already
+                    # excludes the loading window and KICK_GRACE below requires
+                    # it to persist, so this is safe to act on even if we never
+                    # saw it in the right game (e.g. a bad initial placement).
+                    reason = "in a different game than configured"
+                else:
+                    # in the right game (or no target to compare) → healthy
+                    st["_was_ingame"] = True
+                    st.pop("_kick_since", None)
+                    continue
+
+            if reason is None:
+                # e.g. "out" but never confirmed in-game yet → ignore (loading)
+                st.pop("_kick_since", None)
+                continue
+
+            # bad state seen; require it to persist for the grace window
+            since = st.get("_kick_since")
+            if since is None:
+                st["_kick_since"] = now
+                st["_kick_reason"] = reason
+                continue
+            if now - since < KICK_GRACE:
+                continue
+            # confirmed — close the stuck/misplaced client and rejoin
+            if st.get("pid"):
+                kill_pid(st["pid"])
+            st["state"] = "waiting"
+            st["intentional"] = True            # we closed it, not a crash
+            st["rejoin_at"] = now + max(2, int(st["acc"]["rdelay"]))
+            why = st.get("_kick_reason", reason)
+            st.pop("_kick_since", None)
+            st.pop("_kick_reason", None)
+            st.pop("_was_ingame", None)
+            emit("log", f"🥾 {st['acc']['username']} — {why}; "
+                        f"closing & rejoining.")
+            self._notify(f"🥾 {st['acc']['username']} — {why}; rejoining.")
+
     def _check_server_collisions(self, rt: dict, emit, now: float) -> None:
         """When 'different servers' is on, ask Roblox's presence API which server
         each running account is ACTUALLY in (Roblox can silently reroute a join
         into matchmaking, landing two accounts together). If two share a server,
-        kick one and let it rejoin into a different one. Bounded per account so
-        we never kick the same one endlessly when no other server is available."""
+        keep the alphabetically-first one and move the rest. Runs indefinitely —
+        as long as a collision exists it keeps splitting them (the per-account
+        settle window keeps that from becoming a tight loop)."""
         if not (self.diffserver_enabled and not self.joinserver_enabled):
             return
-        if now - self._last_presence_check < 12:      # gentle on the API
+        if now - self._last_presence_check < PRESENCE_INTERVAL:
             return
+        # Only consider accounts that have been in-game a few seconds — a freshly
+        # (re)joined account's presence can briefly read its OLD server, which
+        # would cause a needless double-kick. The grace window avoids that.
         running = [(uid, st) for uid, st in rt.items()
                    if st.get("monitored") and st["state"] == "running"
-                   and st.get("pid")]
+                   and st.get("pid")
+                   and (now - (st.get("open_since") or now)) >= PRESENCE_SETTLE]
         if len(running) < 2:
             return
         self._last_presence_check = now
-        # Query presence using EACH account's own cookie. An account can always
-        # see its own gameId (server), whereas one account often can't see
-        # another's if their join privacy isn't public — so per-account queries
-        # are far more reliable than asking one cookie about everyone.
+        # Use the shared per-cycle presence snapshot (an account sees its own
+        # server reliably; this is fetched once and reused by kick-detection too
+        # so we don't double-poll the API). Group by the server (gameId) each
+        # account is ACTUALLY in.
+        snap = self._running_presence(rt, now)
         presence: dict[int, str] = {}
-        for uid, st in running:
-            ck = st["acc"].get("cookie")
-            if not ck:
-                continue
-            p = fetch_presence([uid], ck)
-            if uid in p:
-                presence[uid] = p[uid]
+        for uid, _st in running:
+            state, _places, gid = snap.get(uid, ("unknown", set(), None))
+            if state == "ingame" and gid:
+                presence[uid] = gid
         if not presence:
             return
         # group running accounts by the server they're actually in
         by_server: dict[str, list[int]] = {}
-        for uid, _ in running:
-            gid = presence.get(uid)
-            if gid:
-                by_server.setdefault(gid, []).append(uid)
+        for uid, gid in presence.items():
+            by_server.setdefault(gid, []).append(uid)
 
         for gid, uids in by_server.items():
             if len(uids) < 2:
                 continue
-            # Randomly choose ONE account to KEEP on this server; the rest get
-            # bumped to different servers. With two accounts that's a 50/50 pick
-            # of which one is killed (rather than always sparing the first).
-            keep = random.choice(uids)
-            for uid in uids:
-                if uid == keep:
-                    continue
-                bumps = self._diff_collision_bumps.get(uid, 0)
-                if bumps >= 6:
-                    emit("log", f"⚠️ {rt[uid]['acc']['username']} keeps landing "
-                                f"in a shared server — leaving it (no distinct "
-                                f"server seems available).")
-                    continue
-                self._diff_collision_bumps[uid] = bumps + 1
+            # Deterministically KEEP the account whose username sorts first
+            # (A–Z); move all the others. Sorting by name is cheaper and more
+            # predictable than a random 50/50 pick — the same account always
+            # "wins" a given server, so accounts settle into a stable order
+            # instead of being re-rolled each time. There's no cap: as long as
+            # two accounts share a server they'll keep getting split, so the
+            # feature works indefinitely (the per-account settle window paces it
+            # so it never becomes a tight loop).
+            ordered = sorted(
+                uids, key=lambda u: (rt[u]["acc"].get("username") or "").lower())
+            keep = ordered[0]
+            for uid in ordered[1:]:
                 st = rt[uid]
-                # release its current assignment so it isn't reused, then rejoin
                 self._diffserver_assigned.pop(uid, None)
                 if st["pid"]:
                     kill_pid(st["pid"])
                 st["state"] = "waiting"
                 st["intentional"] = True       # not a crash
-                st["rejoin_at"] = now + max(3, int(st["acc"]["rdelay"]))
+                st["rejoin_at"] = now + 3      # short, fixed — re-spread fast
                 emit("log", f"⚠️ {st['acc']['username']} shared a server with "
-                            f"another account — moving it to a different one.")
+                            f"{rt[keep]['acc']['username']} — moving it to a "
+                            f"different one.")
                 self._notify(f"🔀 {st['acc']['username']} was sharing a server; "
                              f"moving it to a different one.")
 
@@ -3232,8 +3709,16 @@ class App(ctk.CTk):
                     st["joined_at"] = time.time()
                     st["open_since"] = time.time()
                     st["intentional"] = False
+                    # reset kick-detection tracking for the new session: it must
+                    # re-confirm its state before any future kick can be flagged
+                    st.pop("_was_ingame", None)
+                    st.pop("_kick_since", None)
+                    st.pop("_kick_reason", None)
                     emit("log", f"{st['acc']['username']} is in (pid {pid}). ✓")
                     if (self.diffserver_enabled and not self.joinserver_enabled):
+                        # open_since (set above) starts the PRESENCE_SETTLE grace
+                        # before this account is eligible for a collision check,
+                        # so we don't act on a stale server right after joining.
                         emit("log", f"   ↳ {st['acc']['username']} joined via "
                                     f"matchmaking — will verify its server next.")
                     self._notify(f"✅ {st['acc']['username']} launched.")
@@ -3315,13 +3800,19 @@ class App(ctk.CTk):
             emit("status", ("No accounts selected", MUTED))
             return
         # accounts currently coming up (launching or waiting to rejoin)
+        now = time.time()
         busy = [st for st in monitored
                 if st["state"] in ("launching", "waiting")]
         if busy:
             if len(busy) == 1:
-                uname = busy[0]["acc"].get("username", "account")
-                verb = ("Rejoining" if busy[0]["state"] == "waiting"
-                        else "Launching")
+                b = busy[0]
+                uname = b["acc"].get("username", "account")
+                if b["state"] == "launching":
+                    verb = "Launching"
+                elif now >= b.get("rejoin_at", 0):
+                    verb = "Leaving"      # held by the error-264 departure check
+                else:
+                    verb = "Rejoining"
                 emit("status", (f"{verb} {uname}…", WARN))
             else:
                 emit("status", (f"Launching {len(busy)} account(s)…", WARN))
@@ -3333,11 +3824,22 @@ class App(ctk.CTk):
             emit("status", ("Watching…", GOOD))
 
     def _emit_stats(self, rt: dict) -> None:
-        snap = {uid: {"state": st["state"], "joined_at": st["joined_at"],
-                      "crashes": st["crashes"], "last_crash": st["last_crash"],
-                      "open_since": st.get("open_since"),
-                      "rkill": st["acc"].get("rkill")}
-                for uid, st in rt.items() if st.get("monitored", True)}
+        now = time.time()
+        snap = {}
+        for uid, st in rt.items():
+            if not st.get("monitored", True):
+                continue
+            disp = st["state"]
+            # A killed account that's passed its rejoin time but is still in
+            # "waiting" is being held back by the departure check (_has_left_game)
+            # — i.e. we're waiting for Roblox to stop reporting it in the server
+            # before we relaunch (error-264 guard). Surface that as "leaving".
+            if disp == "waiting" and now >= st.get("rejoin_at", 0):
+                disp = "leaving"
+            snap[uid] = {"state": disp, "joined_at": st["joined_at"],
+                         "crashes": st["crashes"], "last_crash": st["last_crash"],
+                         "open_since": st.get("open_since"),
+                         "rkill": st["acc"].get("rkill")}
         self._emit("acctstat", snap)
         write_session_map({uid: st for uid, st in rt.items()
                            if st.get("monitored", True)})
@@ -3396,8 +3898,9 @@ class App(ctk.CTk):
                 self._diffserver_assigned = {}
                 self._diffserver_pool = []
                 self._diffserver_place = place
-                self._diff_collision_bumps = {}
-                self._last_presence_check = time.time() + 8   # let joins settle
+                # first eligibility is governed per-account by PRESENCE_SETTLE
+                # now, so don't push the whole check far into the future here
+                self._last_presence_check = 0.0
                 self._all_cookies = [a["cookie"] for a in accts
                                      if a.get("cookie")]
                 emit("log", "Different servers: letting Roblox matchmake each "
@@ -3467,6 +3970,7 @@ class App(ctk.CTk):
             while not self.stop_event.is_set():
                 now = time.time()
                 pids = roblox_pids()
+                self._last_pids = pids       # shared with _has_left_game
 
                 # ---- apply finished background launches --------------------
                 self._drain_launches(rt, emit, now)
@@ -3600,6 +4104,10 @@ class App(ctk.CTk):
                     else:
                         emit("log", "Kill Now — no selected account is running.")
 
+                # ---- error-264 guard: check (in parallel) which killed/waiting
+                # ---- accounts have actually left their server, before relaunch
+                self._poll_departures(rt, now)
+
                 for uid, st in rt.items():
                     if self.stop_event.is_set():
                         break
@@ -3632,10 +4140,40 @@ class App(ctk.CTk):
                             self._notify(f"🔪 Auto-kill — {acc['username']} "
                                          f"(every {acc['rkill']}min open).")
                     elif st["state"] == "waiting" and now >= st["rejoin_at"]:
+                        # Don't relaunch until Roblox confirms this account has
+                        # actually LEFT its game. Logging back in while the old
+                        # session is still alive server-side is what triggers the
+                        # "Disconnected (error 264)" boot. Covers every kill path
+                        # (auto-kill, sync-kill, Kill Now, collision-move, bot
+                        # rejoin, duplicate-window) plus crashes, since they all
+                        # funnel through this one transition.
+                        if not self._has_left_game(uid, st, now):
+                            continue          # still in-game — re-check shortly
                         st["intentional"] = False
                         st["state"] = "launching"
+                        for _k in ("_leave_deadline", "_next_leave_poll",
+                                   "_leave_logged", "_left_ok", "_leave_for"):
+                            st.pop(_k, None)
                         emit("log", f"Rejoining {acc['username']}…")
                         self._begin_launch(uid, acc, emit)
+
+                # ---- bot-requested rejoins: kill now, watcher relaunches ------
+                if self._rejoin_requests:
+                    for uid in list(self._rejoin_requests):
+                        st = rt.get(uid)
+                        if not st or not st.get("monitored"):
+                            continue
+                        if st["pid"]:
+                            kill_pid(st["pid"])
+                        st["state"] = "waiting"
+                        st["intentional"] = True       # not a crash
+                        st["rejoin_at"] = now + max(2, int(st["acc"]["rdelay"]))
+                        emit("log", f"{st['acc']['username']} — rejoin requested "
+                                    f"from Discord; restarting.")
+                    self._rejoin_requests.clear()
+
+                # ---- kick detection: kicked/disconnected but client open -----
+                self._check_kicks(rt, emit, now)
 
                 # ---- different-servers: detect & break up shared servers -----
                 self._check_server_collisions(rt, emit, now)
@@ -3671,12 +4209,20 @@ class App(ctk.CTk):
                                 else sorted(self.selected_ids))
         self.cfg["tile_windows"] = bool(self.tile_enabled)
         self.cfg["detect_open"] = bool(self.detect_open_enabled)
+        self.cfg["kickdetect_on"] = bool(self.kickdetect_enabled)
         self.cfg["autokill_on"] = bool(self.autokill_armed)
         self.cfg["synckill_on"] = bool(self.synckill_enabled)
         if hasattr(self, "joinserver_entry"):
             self._joinserver_url = self.joinserver_entry.get().strip()
         self.cfg["joinserver_on"] = bool(self.joinserver_enabled)
         self.cfg["diffserver_on"] = bool(self.diffserver_enabled)
+        # auto-maintenance intervals (minutes; 0 = disabled)
+        if hasattr(self, "logclear_entry"):
+            self.cfg["log_clear_min"] = self._clean_int(
+                self.logclear_entry.get(), default=0, lo=0, hi=10080)
+        if hasattr(self, "cacheclear_entry"):
+            self.cfg["cache_clear_min"] = self._clean_int(
+                self.cacheclear_entry.get(), default=0, lo=0, hi=10080)
         # region/ping features were removed (Roblox rate-limits the only APIs
         # that could power them) — drop any stale keys from older configs
         for _k in ("regions", "region_filter", "region", "max_ping"):
@@ -3698,15 +4244,22 @@ class App(ctk.CTk):
     def _write_accounts_to_cfg(self) -> None:
         enc = []
         for a in self.accounts:
-            if not a.get("cookie"):
+            cookie = a.get("cookie")
+            if cookie:
+                try:
+                    blob = dpapi_encrypt(cookie)
+                except Exception:
+                    blob = a.get("cookie_enc", "")
+            else:
+                # couldn't decrypt this account earlier (e.g. config from another
+                # PC) — preserve its original blob instead of dropping it
+                blob = a.get("cookie_enc", "")
+            if not blob:
                 continue
-            try:
-                enc.append({"user_id": a["user_id"], "username": a["username"],
-                            "cookie_enc": dpapi_encrypt(a["cookie"]),
-                            "place": a.get("place", ""), "delay": a.get("delay", ""),
-                            "killmin": a.get("killmin", "")})
-            except Exception:
-                pass
+            enc.append({"user_id": a["user_id"], "username": a["username"],
+                        "cookie_enc": blob,
+                        "place": a.get("place", ""), "delay": a.get("delay", ""),
+                        "killmin": a.get("killmin", "")})
         self.cfg["accounts"] = enc
 
     def _on_close(self) -> None:
