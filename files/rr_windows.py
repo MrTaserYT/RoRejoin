@@ -34,6 +34,134 @@ def roblox_pids() -> set[int]:
     return pids
 
 
+# ─────────────────────────────────── joke: which executor is open? ─────────
+# Maps a running process' executable base-name (lowercased, no ".exe") to a
+# (display name, totally-serious-and-scientific rating /10). Matching is by
+# exact base-name so we don't false-positive on random processes. Researched
+# from 2026 executor listings (WEAO / executor trackers). Windows-only — mobile
+# (Android/iOS) and macOS executors are intentionally left out since they can't
+# run as a Windows process anyway. Purely a gag.
+EXECUTOR_RATINGS: dict[str, tuple[str, int]] = {
+    "volt":         ("Volt", 10),
+    "wave":         ("Wave", "RAT"),
+    "seliware":     ("Seliware", "6"),
+    "potassium":    ("Potassium", "Tuff"),
+    "synapse":      ("Synapse", 7),
+    "synapsez":     ("Synapse Z", 7),
+    "scriptware":   ("Script-Ware", 7),
+    "matcha":       ("Matcha", 3),
+    "velocity":     ("Velocity", 6),
+    "madium":       ("Madium", 7),
+    "bytebreaker":  ("ByteBreaker", 5),
+    "swift":        ("Swift", 5),
+    "codex":        ("Codex", 5),
+    "fluxus":       ("Fluxus", 4),
+    "krnl":         ("Krnl", 4),
+    "valex":        ("Valex", 3),
+    "evon":         ("Evon", "SAKRAT"),
+    "luna":         ("Luna", 3),
+    "solara":       ("Solara", "ASS"),
+    "xeno":         ("Xeno", "RETARD"),
+    "nihon":        ("Nihon", 2),
+    "comet":        ("Comet", 1),
+    "jjsploit":     ("JJSploit", 1),
+}
+
+
+def _matches_executor(text: str) -> tuple[str, int] | None:
+    """Given a window title or process base-name, return the (name, rating) of
+    the executor it represents, or None. Matching is anchored to the START of
+    the cleaned text (executors put their brand first, e.g. 'Wave 4.2',
+    'Xeno v1.0.0', 'Solara - ...') so we don't false-positive on unrelated
+    windows that merely contain a word like 'wave' somewhere in the middle."""
+    if not text:
+        return None
+    low = text.lower().strip()
+    # collapse separators so "script-ware", "script ware", "scriptware" all match
+    norm = (low.replace("-", "").replace("_", "").replace("|", " ")
+               .replace(":", " "))
+    norm_nospace = norm.replace(" ", "")
+    first_word = norm.split()[0] if norm.split() else ""
+    # check more-specific (longer) keys first so e.g. "synapsez" wins over
+    # "synapse" and the more precise display name is shown
+    for key in sorted(EXECUTOR_RATINGS, key=len, reverse=True):
+        val = EXECUTOR_RATINGS[key]
+        # exact, or brand at the very start followed by version/extra text
+        if (norm_nospace == key
+                or first_word == key
+                or norm_nospace.startswith(key) and (
+                    len(norm_nospace) == len(key)
+                    or not norm_nospace[len(key)].isalpha())):
+            return val
+    return None
+
+
+def _enum_window_titles() -> list[str]:
+    """Titles of every visible, titled top-level window on screen."""
+    if user32 is None:
+        return []
+    titles: list[str] = []
+    try:
+        user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                          ctypes.c_int]
+    except Exception:
+        pass
+    proto = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cb(h, _l):
+        try:
+            if user32.IsWindowVisible(h):
+                n = user32.GetWindowTextLengthW(h)
+                if n and n > 0:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(h, buf, n + 1)
+                    t = buf.value.strip()
+                    if t:
+                        titles.append(t)
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(proto(_cb), 0)
+    except Exception:
+        pass
+    return titles
+
+
+def detect_executor() -> tuple[str, int] | None:
+    """Figure out which Roblox executor is open and return its (name, joke
+    rating). Primary signal is the OPEN WINDOW's title (most executors brand the
+    window even when their process name is randomised to dodge detection);
+    process image names are used as a secondary signal. Returns the
+    highest-rated match, or None if nothing is open. Joke feature only."""
+    if not IS_WINDOWS:
+        return None
+    best: tuple[str, int] | None = None
+
+    # 1) window titles — the reliable signal
+    for title in _enum_window_titles():
+        hit = _matches_executor(title)
+        if hit and (best is None or hit[1] > best[1]):
+            best = hit
+
+    # 2) process image names — catch executors whose window we missed
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            creationflags=CREATE_NO_WINDOW, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="ignore")
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        first = line.split('","', 1)[0].strip().strip('"')
+        if first.lower().endswith(".exe"):
+            hit = _matches_executor(first[:-4])
+            if hit and (best is None or hit[1] > best[1]):
+                best = hit
+    return best
+
+
 def kill_pid(pid: int) -> bool:
     try:
         subprocess.run(["taskkill", "/F", "/PID", str(pid)],

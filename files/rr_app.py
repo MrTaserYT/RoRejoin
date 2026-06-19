@@ -34,7 +34,7 @@ from rr_storage import (_atomic_write, dpapi_decrypt, dpapi_encrypt, load_config
                         read_remote_commands, save_config, write_session_map)
 from rr_windows import (find_all_windows_for_pid, find_window_for_pid,
                         focus_window, kill_all_roblox, kill_pid, roblox_pids,
-                        stack_windows, tile_windows)
+                        stack_windows, tile_windows, detect_executor)
 from rr_roblox import (build_launch_uri, detect_last_place, get_account_info,
                        get_auth_ticket, parse_place_id, parse_share_link,
                        presence_detail, presence_state, resolve_share_link)
@@ -135,6 +135,8 @@ class App(ctk.CTk):
         # bridge + animation timing
         self._last_state_pub = 0.0
         self._last_slow_refresh = 0.0    # throttle live-target/discord refresh
+        self._last_executor_scan = 0.0   # throttle the (joke) executor detector
+        self._executor_scanning = False
         # auto-maintenance timers (reset when their interval fires)
         self._last_log_clear = time.time()
         self._last_cache_clear = time.time()
@@ -354,9 +356,13 @@ class App(ctk.CTk):
             text_color=BAD, command=self._kill_now)
         self.kill_now_btn.grid(row=0, column=1, sticky="ew")
 
-        ctk.CTkLabel(self, text="RoRejoin launches your accounts itself.",
-                     font=self.f_sub, text_color=MUTED
-                     ).grid(row=2, column=0, pady=(0, 8))
+        # joke feature: show which Roblox executor is currently open + a wholly
+        # unscientific rating. Updated live in _pump. Falls back to a neutral
+        # line when nothing is detected.
+        self.executor_lbl = ctk.CTkLabel(
+            self, text="Executor: none detected",
+            font=self.f_sub, text_color=MUTED)
+        self.executor_lbl.grid(row=2, column=0, pady=(0, 8))
 
         # click anywhere that isn't a text field → drop focus from the entry
         # being edited, so typing stops (like every other app)
@@ -1529,8 +1535,44 @@ class App(ctk.CTk):
             self._refresh_discord_runtime()
             self._refresh_live_targets()
             self._run_auto_maintenance(now)
+            self._scan_executor(now)
         self._publish_state()
         self.after(80, self._pump)
+
+    def _scan_executor(self, now: float) -> None:
+        """(Joke) Update the 'Executor: … x/10' line. The process scan does a
+        brief tasklist call, so run it off the UI thread and marshal the result
+        back. Throttled — executors don't pop in and out every second."""
+        if self._executor_scanning or now - self._last_executor_scan < 2.0:
+            return
+        self._last_executor_scan = now
+        self._executor_scanning = True
+
+        def finish(res):
+            self._executor_scanning = False
+            if not hasattr(self, "executor_lbl"):
+                return
+            if res:
+                name, rating = res
+                colour = (GOOD if rating >= 8 else
+                          WARN if rating >= 4 else BAD)
+                self.executor_lbl.configure(
+                    text=f"Executor: {name}  {rating}/10", text_color=colour)
+            else:
+                self.executor_lbl.configure(
+                    text="Executor: none detected", text_color=MUTED)
+
+        def work():
+            try:
+                res = detect_executor()
+            except Exception:
+                res = None
+            try:
+                self.after(0, lambda: finish(res))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _run_auto_maintenance(self, now: float) -> None:
         """Periodically clear the on-screen log and/or transient caches, on the
