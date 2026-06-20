@@ -61,7 +61,7 @@ EXECUTOR_RATINGS: dict[str, tuple[str, int]] = {
     "evon":         ("Evon", "SAKRAT"),
     "luna":         ("Luna", 3),
     "solara":       ("Solara", "ASS"),
-    "xeno":         ("Xeno", "RETARD"),
+    "xeno":         ("Xeno", "TRASH"),
     "nihon":        ("Nihon", 2),
     "comet":        ("Comet", 1),
     "jjsploit":     ("JJSploit", 1),
