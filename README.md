@@ -22,8 +22,10 @@ RoRejoin is the ultimate tool for autofarmers running multiple Roblox accounts a
 
 Built with Python, CustomTkinter, Claude Opus 4.8 (main), gemini (only small stuff)
 
-**!Warning**
-Virustotal says RoRejoin is a trojan, it is not. You can check out the source code and do research, Virustotal is not very accurate!
+**⚠️ Antivirus false positive**
+
+Some antivirus tools may flag RoRejoin.exe as suspicious. This is a known false positive caused by PyInstaller — the tool used to bundle Python scripts into a single executable. The detection is triggered by the bundler itself, not by anything RoRejoin does.
+The full source code is included in RoRejoin.zip on this page. You can read every line and build the exe yourself by running build_exe.bat — it installs the dependencies and compiles everything in one step.
 
 
 <img width="1402" height="827" alt="RoRejoinV2 Setup" src="https://github.com/user-attachments/assets/3898b024-bb0e-46f9-b0e6-1fb65b50ad96" />
