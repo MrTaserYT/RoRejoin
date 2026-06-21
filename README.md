@@ -1,7 +1,8 @@
-V2.21 (last probably)
-Added executor detect for fun, just tells you what executor you're using and rates it.
+V2.3 (last probably)
+Added a feature "Unlock window size", this is to prevent window overlapping when using more than 3 accounts.
 
-
+Download:
+[RoRejoin.zip](https://github.com/user-attachments/files/29172153/RoRejoin.zip)
 
 **RoRejoin** is the ultimate tool for Roblox auto farms. It a Windows desktop app for managing multiple Roblox accounts simultaneously. It watches your running Roblox instances in the background and automatically relaunches any that crash or get disconnected — so you never have to babysit your sessions.
 
