@@ -1,8 +1,9 @@
-V2.3 (last probably)
-Added a feature "Unlock window size", this is to prevent window overlapping when using more than 3 accounts.
+V2.31
+Added cool (lowkey janky but I'm too lazy to fix it) animations to the menu.
 
 Download:
-[RoRejoin.zip](https://github.com/user-attachments/files/29172153/RoRejoin.zip)
+[RoRejoin.zip](https://github.com/user-attachments/files/29214572/RoRejoin.zip)
+
 
 **RoRejoin**
 RoRejoin is the ultimate tool for autofarmers running multiple Roblox accounts at once. Launch and watch any number of clients side by side — if one crashes, gets kicked, or lands in the wrong game, RoRejoin instantly closes it and rejoins a fresh server, no babysitting required. Every account gets its own game and rejoin delay, with a live dashboard tracking uptime, crashes, and status. Tile all your windows into a clean grid and unlock their size to pack dozens onto one screen. Cookies are encrypted on disk with Windows DPAPI, auto-kill keeps sessions fresh, and the different-servers spreader scatters accounts apart.
