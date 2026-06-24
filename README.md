@@ -1,8 +1,8 @@
-V2.31
-Added cool (lowkey janky but I'm too lazy to fix it) animations to the menu.
+Version: V3
+Added a bunch of features and switched from Ctk to PySide6.
 
 Download:
-[RoRejoin.zip](https://github.com/user-attachments/files/29214572/RoRejoin.zip)
+[RoRejoin-Qt.zip](https://github.com/user-attachments/files/29282075/RoRejoin-Qt.zip)
 
 
 **RoRejoin**
@@ -16,12 +16,19 @@ RoRejoin is the ultimate tool for autofarmers running multiple Roblox accounts a
 - Different-servers mode — spread each account across its own separate public server
 - Detect open clients — adopt Roblox windows that are already running instead of launching new ones
 - Window tiling and stacking layouts for multi-instance setups
+- kick detection — detects when an account has been kicked from the game and relaunches it automatically
 - Unlock window size — strips the client's border so tiled windows shrink past Roblox's ~800×600 minimum, packing dozens onto one screen
+- Schedule — automatically make it start itself at a given time with the option to repeat it daily 
 - Live monitor dashboard with uptime, crash count, and auto-kill countdowns
 - Optional Discord webhook notifications (usernames and events only — never cookies)
 - Settings persist between sessions with DPAPI-encrypted cookie storage
 
-Built with Python, CustomTkinter, Claude Opus 4.8 (main), gemini (only small stuff)
+<img width="1250" height="825" alt="RoRejoin Setup Page" src="https://github.com/user-attachments/assets/73bea1ea-24d8-4f16-ab1b-a04c5a893116" />
+<img width="1250" height="825" alt="RoRejoin Accounts Page" src="https://github.com/user-attachments/assets/34b84c73-22c6-48a6-bc90-60f42283fdd4" />
+<img width="1250" height="825" alt="RoRejoin Monitor Page" src="https://github.com/user-attachments/assets/adbfc2ac-5393-43c1-8ea4-d31f54a20cdc" />
+
+
+Built with Python, PySide6, Claude Opus 4.8 (main), gemini (only small stuff)
 
 **⚠️ Antivirus false positive**
 
