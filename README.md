@@ -34,4 +34,4 @@ Built with Python, PySide6, Claude Opus 4.8 (main), gemini (only small stuff)
 **⚠️ Antivirus false positive**
 
 Some antivirus tools may flag RoRejoin.exe as suspicious. I don't know why.
-The full source code is included in RoRejoin-Qt.zip on this page. You can read every line and build the exe yourself by running build_exe.bat — it installs the dependencies and compiles everything in one step.
+The full source code is included in RoRejoin-Qt.zip on this page. You can read every line and build the exe yourself by running build_qt.bat — it installs the dependencies and compiles everything in one step.
